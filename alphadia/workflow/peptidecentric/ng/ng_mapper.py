@@ -1,5 +1,7 @@
 """Conversion of AlphaDIA to NG data structure and back."""
 
+import logging
+
 import numpy as np
 import pandas as pd
 from alphabase.spectral_library.flat import SpecLibFlat
@@ -14,6 +16,8 @@ from alphadia_search_rs import (
 from alphadia_search_rs import SpecLibFlat as SpecLibFlatNG
 
 from alphadia.raw_data import DiaData
+
+logger = logging.getLogger(__name__)
 
 
 def set_ng_thread_count(thread_count: int) -> None:
@@ -48,6 +52,158 @@ def dia_data_to_ng(dia_data: DiaData) -> "DiaDataNG":  # noqa: F821
         peak_df["mz"].values.astype(np.float32),
         peak_df["intensity"].values.astype(np.float32),
         dia_data.cycle.astype(np.float32),
+    )
+
+
+def tims_to_ng(tims_data: "TimsTOFTranspose") -> "DiaDataNG":  # noqa: F821
+    """Convert TimsTOFTranspose to DiaDataNG for the rust extraction backend.
+
+    Collapses the ion mobility (1/K0) dimension by summing intensities across
+    all scans within each MS2 frame. This produces one flat spectrum per frame,
+    which the rust DIAData builder already understands. Mobility separation is
+    not exploited in this implementation — week-2 work will extend the rust
+    builder to handle the full 3D (RT × m/z × 1/K0) search window natively.
+
+    Parameters
+    ----------
+    tims_data : TimsTOFTranspose
+        Transposed timsTOF data loaded from a Bruker .d folder.
+
+    Returns
+    -------
+    DiaDataNG
+        Flat spectrum representation ready for the rust extraction backend.
+
+    Notes
+    -----
+    RT values from alpharaw are in **seconds** (from the Bruker SQL ``Time``
+    column), so no unit conversion is needed here. This differs from the mzML
+    path in :func:`dia_data_to_ng`, which multiplies by 60.
+    """
+    scan_max = tims_data.scan_max_index
+    n_frames = tims_data.frame_max_index
+    cycle_len = tims_data.cycle.shape[1]
+
+    logger.info(
+        f"tims_to_ng: {n_frames} frames, {scan_max} scans/frame, "
+        f"cycle_len={cycle_len}, rt range [{tims_data.rt_values[0]:.1f}, "
+        f"{tims_data.rt_values[-1]:.1f}] s"
+    )
+
+    # ── Invert transposed CSR: tof_indptr/push_indices → (frame, tof, intensity) ─
+    #
+    # After TimsTOFTranspose.transpose():
+    #   _tof_indptr  (int64,  tof_max+1):  CSR row ptrs indexed by tof_index
+    #   _push_indices (uint32, n_peaks):    push = frame*scan_max + scan for each peak
+    #   _intensity_values (uint16, n_peaks): reordered intensities
+    #
+    # We need frame_of_peak and tof_of_peak, then group-by-frame.
+
+    push_indices = tims_data._push_indices          # uint32 (n_peaks,)
+    tof_indptr   = tims_data._tof_indptr            # int64  (tof_max+1,)
+    intensity    = tims_data._intensity_values      # uint16 (n_peaks,)
+    mz_values    = tims_data.mz_values              # float64 (tof_max,)
+    n_peaks      = len(push_indices)
+
+    frame_of_peak = (push_indices // scan_max).astype(np.int64)
+
+    # Reconstruct tof_index per peak by inverting tof_indptr
+    tof_of_peak = np.empty(n_peaks, dtype=np.int32)
+    n_tof = len(tof_indptr) - 1
+    for tof_idx in range(n_tof):
+        s = tof_indptr[tof_idx]
+        e = tof_indptr[tof_idx + 1]
+        if e > s:
+            tof_of_peak[s:e] = tof_idx
+
+    # Sort peaks by (frame, tof) so we can slice per-frame cheaply
+    sort_order   = np.lexsort((tof_of_peak, frame_of_peak))
+    sorted_frame = frame_of_peak[sort_order]
+    sorted_tof   = tof_of_peak[sort_order]
+    sorted_int   = intensity[sort_order].astype(np.float32)
+
+    # Boundaries of each frame's peaks in the sorted array
+    frame_boundaries = np.searchsorted(sorted_frame, np.arange(n_frames + 1))
+
+    # ── Build per-frame spectra, summing duplicate tof indices ───────────────
+    frame_peak_mz  = [None] * n_frames
+    frame_peak_int = [None] * n_frames
+
+    for f in range(n_frames):
+        sl   = slice(int(frame_boundaries[f]), int(frame_boundaries[f + 1]))
+        tofs = sorted_tof[sl]
+        ints = sorted_int[sl]
+
+        if len(tofs) == 0:
+            frame_peak_mz[f]  = np.empty(0, dtype=np.float32)
+            frame_peak_int[f] = np.empty(0, dtype=np.float32)
+            continue
+
+        # Sum intensities at the same tof index (multiple mobility scans → one peak)
+        unique_tofs, inverse = np.unique(tofs, return_inverse=True)
+        summed_int = np.zeros(len(unique_tofs), dtype=np.float32)
+        np.add.at(summed_int, inverse, ints)
+
+        frame_peak_mz[f]  = mz_values[unique_tofs].astype(np.float32)
+        frame_peak_int[f] = summed_int
+
+    # ── Flatten to contiguous peak arrays with start/stop indices ────────────
+    peak_counts    = np.array([len(x) for x in frame_peak_mz], dtype=np.int64)
+    peak_start_idx = np.empty(n_frames, dtype=np.int64)
+    peak_start_idx[0] = 0
+    if n_frames > 1:
+        peak_start_idx[1:] = np.cumsum(peak_counts[:-1])
+    peak_stop_idx = peak_start_idx + peak_counts
+
+    all_mz  = np.concatenate(frame_peak_mz).astype(np.float32)
+    all_int = np.concatenate(frame_peak_int).astype(np.float32)
+
+    logger.info(
+        f"tims_to_ng: flattened to {len(all_mz):,} peaks across {n_frames} frames"
+    )
+
+    # ── Isolation windows per frame from dia_mz_cycle ────────────────────────
+    #
+    # dia_mz_cycle[i] = [lower_mz, upper_mz] for cycle position i.
+    # MS2 frames map to cycle positions; MS1 frames get (0, 0).
+    dia_mz       = tims_data.dia_mz_cycle           # (cycle_len, 2)
+    frames_table = tims_data.frames                  # pd.DataFrame from SQL
+    ms2_mask     = frames_table["MsMsType"].values != 0  # bool (n_frames,)
+
+    isolation_lower = np.zeros(n_frames, dtype=np.float32)
+    isolation_upper = np.zeros(n_frames, dtype=np.float32)
+
+    frame_in_cycle = np.arange(n_frames) % cycle_len
+    # Guard against dia_mz_cycle being shorter than max cycle position
+    valid_cycle_pos = frame_in_cycle[ms2_mask]
+    in_bounds = valid_cycle_pos < len(dia_mz)
+    ms2_idx = np.where(ms2_mask)[0]
+
+    isolation_lower[ms2_idx[in_bounds]] = dia_mz[valid_cycle_pos[in_bounds], 0].astype(
+        np.float32
+    )
+    isolation_upper[ms2_idx[in_bounds]] = dia_mz[valid_cycle_pos[in_bounds], 1].astype(
+        np.float32
+    )
+
+    # ── Cycle-level indices ───────────────────────────────────────────────────
+    delta_scan_idx = (np.arange(n_frames) % cycle_len).astype(np.int64)
+    cycle_idx      = (np.arange(n_frames) // cycle_len).astype(np.int64)
+
+    # rt_values from alpharaw is already in seconds (Bruker SQL Time column)
+    rt_seconds = tims_data.rt_values.astype(np.float32)
+
+    return DiaDataNG.from_arrays(
+        delta_scan_idx,
+        isolation_lower,
+        isolation_upper,
+        peak_start_idx,
+        peak_stop_idx,
+        cycle_idx,
+        rt_seconds,
+        all_mz,
+        all_int,
+        tims_data.cycle.astype(np.float32),
     )
 
 

@@ -18,6 +18,7 @@ from alphadia.workflow.managers.timing_manager import TimingManager
 from alphadia.workflow.peptidecentric.ng.ng_mapper import (
     dia_data_to_ng,
     set_ng_thread_count,
+    tims_to_ng,
 )
 
 logger = logging.getLogger()
@@ -120,14 +121,17 @@ class WorkflowBase:
         if self._config["search"]["extraction_backend"] == "rust":
             time_start = time.time()
             if isinstance(self._dia_data, TimsTOFTranspose):
-                raise GenericUserError(
-                    "NOT_SUPPORTED_BY_NG",
-                    "Rust backend does not support TimsTOF data yet. Please use extraction_backend='python'.",
+                self.reporter.log_string(
+                    "TimsTOF detected: collapsing ion mobility dimension for rust backend "
+                    "(intensities summed across scans per frame). "
+                    "Week-2 work will add native 3D 1/K0 support."
                 )
+                dia_data_ng = tims_to_ng(self._dia_data)
+            else:
+                dia_data_ng = dia_data_to_ng(self._dia_data)
+
             # needs to be the first call to alphadia-search-rs
             set_ng_thread_count(self.config["general"]["thread_count"])
-
-            dia_data_ng = dia_data_to_ng(self._dia_data)
 
             # TODO: remove these asserts
             assert self.dia_data.cycle.shape[1] == dia_data_ng.cycle.shape[1]
