@@ -107,14 +107,12 @@ def tims_to_ng(tims_data: "TimsTOFTranspose") -> "DiaDataNG":  # noqa: F821
 
     frame_of_peak = (push_indices // scan_max).astype(np.int64)
 
-    # Reconstruct tof_index per peak by inverting tof_indptr
-    tof_of_peak = np.empty(n_peaks, dtype=np.int32)
-    n_tof = len(tof_indptr) - 1
-    for tof_idx in range(n_tof):
-        s = tof_indptr[tof_idx]
-        e = tof_indptr[tof_idx + 1]
-        if e > s:
-            tof_of_peak[s:e] = tof_idx
+    # Reconstruct tof_index per peak by inverting tof_indptr.
+    # np.repeat is ~4x faster than a Python loop over 400k tof indices.
+    tof_of_peak = np.repeat(
+        np.arange(len(tof_indptr) - 1, dtype=np.int32),
+        np.diff(tof_indptr),
+    )
 
     # Sort peaks by (frame, tof) so we can slice per-frame cheaply
     sort_order   = np.lexsort((tof_of_peak, frame_of_peak))

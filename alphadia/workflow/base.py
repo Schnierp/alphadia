@@ -2,6 +2,8 @@ import logging
 import os
 import time
 
+import numpy as np
+
 from alphabase.spectral_library.flat import SpecLibFlat
 
 from alphadia.constants.keys import ConfigKeys
@@ -135,7 +137,11 @@ class WorkflowBase:
 
             # TODO: remove these asserts
             assert self.dia_data.cycle.shape[1] == dia_data_ng.cycle.shape[1]
-            assert all(self.dia_data.rt_values == dia_data_ng.rt_values)
+            # tims_to_ng converts rt_values to float32 for the rust builder, so use
+            # allclose instead of exact equality (float32 precision is ~1e-7 relative).
+            assert np.allclose(
+                self.dia_data.rt_values, dia_data_ng.rt_values, rtol=1e-5
+            )
 
             self._dia_data = dia_data_ng
             self.reporter.log_string(
